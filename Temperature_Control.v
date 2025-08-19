@@ -1,6 +1,8 @@
+`timescale 1ns / 1ps
+
 // Temperature Module for Fast Charging Battery Management
 
-module temperature_control (
+module Temperature_Control (
     input wire clk,
     input wire reset,
     input wire charging,
@@ -8,38 +10,42 @@ module temperature_control (
     output reg [6:0] temp,
     output reg charging_mode, // 0 = Fast Charging, 1 = Slow Charging
     output reg cooling_fan // 1 = Cooling fan active, 0 = Cooling fan inactive
-);
+    );
 
     // States
-    typedef enum logic [1:0] {
-        IDLE = 2'b00,
-        FAST_CHARGING = 2'b01,
-        SLOW_CHARGING = 2'b10
-    } state_t;
-
-    state_t present_state, next_state;
+    localparam IDLE = 2'b00;
+    localparam FAST_CHARGING = 2'b01;
+    localparam SLOW_CHARGING = 2'b10;
+    
+    reg [1:0] present_state, next_state;
 
     // Constants  
     localparam INITIAL_TEMP = 7'd27; // Initial temperature is 27°C
     localparam MAX_TEMP = 7'd45;     // Maximum temperature before switching to slow charging
     localparam MIN_TEMP = 7'd27;     // Minimum temperature limit
-    localparam SLOW_START_CYCLE = 7'd80; // Clock cycle to start slow charging
-    localparam SLOW_END_CYCLE = 7'd100;  // Clock cycle for end of slow charging
+    localparam SLOW_START_CYCLE = 7'd80; // Battery percent to start slow charging
+    localparam SLOW_END_CYCLE = 7'd100;  // Battery percent for end of slow charging
 
-    // Internal signal to track increments
-    reg [3:0] battery_count; // To count 10% increments (0 to 10)
-    reg [4:0] battery_count_slow; // To count 20% increments (0 to 20)
+    // Internal signals to track battery level changes
+    reg [6:0] prev_battery_percent;
+    reg [6:0] temp_next;
+    reg cooling_fan_next;
+    reg charging_mode_next;
 
-    // Sequential Logic: State Transitions
+    // Sequential Logic: State Transitions and Register Updates
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             present_state <= IDLE;
             temp <= INITIAL_TEMP;
-            battery_count <= battery_percent % 10;
-            battery_count_slow <= battery_percent % 20;
-            cooling_fan <= 1'b0; // Ensure cooling fan is inactive on reset
+            prev_battery_percent <= 7'd0;
+            charging_mode <= 1'b0;
+            cooling_fan <= 1'b0;
         end else begin
             present_state <= next_state;
+            temp <= temp_next;
+            charging_mode <= charging_mode_next;
+            cooling_fan <= cooling_fan_next;
+            prev_battery_percent <= battery_percent;
         end
     end
 
@@ -47,69 +53,82 @@ module temperature_control (
     always @(*) begin
         // Default values
         next_state = present_state;
-        charging_mode = 1'b0; // Default to Fast Charging
-        cooling_fan = 1'b0; // Default to cooling fan inactive
+        charging_mode_next = 1'b0; // Default to Fast Charging
+        cooling_fan_next = cooling_fan; // Maintain current cooling fan state
+        temp_next = temp; // Maintain current temperature
 
         case (present_state)
             IDLE: begin
                 if (charging && (battery_percent < SLOW_START_CYCLE)) begin
                     next_state = FAST_CHARGING;
                 end else if (charging && (battery_percent >= SLOW_START_CYCLE) && (battery_percent <= SLOW_END_CYCLE)) begin
-                    next_state = SLOW_CHARGING; // Switch to slow charging for clock cycles 80 to 100
-                end else begin
-                    next_state = IDLE;
+                    next_state = SLOW_CHARGING;
                 end
+                // Temperature remains constant in IDLE state
             end
 
             FAST_CHARGING: begin
-                if (charging) begin
-                    if (battery_percent < SLOW_START_CYCLE) begin
-                        if ((battery_percent % 10) == 0) begin
-                            temp = temp + 7'd1; // Increase temperature by 1°C
-                            if (temp >= MAX_TEMP) begin
-                                next_state = SLOW_CHARGING; // Overheating: Switch to slow charging
-                                cooling_fan = 1'b1; // Activate cooling fan on overheating
-                            end
-                        end
-                    end else begin
-                        next_state = SLOW_CHARGING; // Automatically switch to slow charging after cycle 80
-                    end
+                charging_mode_next = 1'b0; // Fast charging mode
+                
+                if (!charging) begin
+                    next_state = IDLE;
+                end else if (battery_percent >= SLOW_START_CYCLE) begin
+                    next_state = SLOW_CHARGING; // Switch to slow charging after 80%
                 end else begin
-                    next_state = IDLE; // Charger unplugged
+                    // Check for 10% battery increment to increase temperature
+                    // if ((battery_percent % 10) == 0)
+                    if ((battery_percent >= 10) && (prev_battery_percent < 10) ||
+                        (battery_percent >= 20) && (prev_battery_percent < 20) ||
+                        (battery_percent >= 30) && (prev_battery_percent < 30) ||
+                        (battery_percent >= 40) && (prev_battery_percent < 40) ||
+                        (battery_percent >= 50) && (prev_battery_percent < 50) ||
+                        (battery_percent >= 60) && (prev_battery_percent < 60) ||
+                        (battery_percent >= 70) && (prev_battery_percent < 70) ||
+                        (battery_percent >= 80) && (prev_battery_percent < 80)) begin
+                        
+                        temp_next = temp + 7'd1; // Increase temperature by 1°C
+                        
+                        if (temp_next >= MAX_TEMP) begin
+                            next_state = SLOW_CHARGING; // Overheating: Switch to slow charging
+                            cooling_fan_next = 1'b1; // Activate cooling fan on overheating
+                        end
+                    end
                 end
             end
 
             SLOW_CHARGING: begin
-                charging_mode = 1'b1; // Slow charging mode
+                charging_mode_next = 1'b1; // Slow charging mode
+                
                 if (!charging) begin
                     next_state = IDLE;
-                end else if ((battery_percent >= SLOW_START_CYCLE) && (battery_percent <= SLOW_END_CYCLE)) begin
+                end else begin
+                    // Temperature management in slow charging
                     if (temp > MAX_TEMP) begin
-                        temp = temp - 7'd1; // Decrease temperature slowly
-                        cooling_fan = 1'b1; // Keep cooling fan active if temperature exceeds max
-                    end else if (temp < MAX_TEMP && (battery_percent % 20) == 0) begin
-                        temp = temp + 7'd1; // Increment temperature by 1°C for every 20% battery increase
+                        temp_next = temp - 7'd1; // Decrease temperature slowly
+                        cooling_fan_next = 1'b1; // Keep cooling fan active
+                    end else if (temp <= MAX_TEMP) begin
+                        cooling_fan_next = 1'b0; // Deactivate cooling fan when temperature is controlled
+                        
+                        // Check for 20% battery increment in slow charging
+                        if ((battery_percent >= 80) && (prev_battery_percent < 80) ||
+                            (battery_percent >= 100) && (prev_battery_percent < 100)) begin
+                            temp_next = temp + 7'd1; // Increment temperature by 1°C for every 20% increase
+                        end
                     end
-
-                    temp = (temp < MIN_TEMP) ? MIN_TEMP : temp; // Clamp temperature to MIN_TEMP
-                end
-
-                if (temp <= MAX_TEMP) begin
-                    cooling_fan = 1'b0; // Deactivate cooling fan when temperature is under control
+                    
+                    // Ensure temperature doesn't go below minimum
+                    if (temp_next < MIN_TEMP) begin
+                        temp_next = MIN_TEMP;
+                    end
                 end
             end
 
-            default: next_state = IDLE;
+            default: begin
+                next_state = IDLE;
+                charging_mode_next = 1'b0;
+                cooling_fan_next = 1'b0;
+            end
         endcase
-    end
-
-    // Preserve temperature in IDLE state
-    always @(posedge clk or posedge reset) begin
-        if (reset) begin
-            temp <= INITIAL_TEMP;
-        end else if (present_state == IDLE) begin
-            temp <= temp; // Hold the temperature
-        end
     end
 
 endmodule
